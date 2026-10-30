@@ -1,0 +1,131 @@
+// File:    live_test.skink
+// Purpose: Live integration test for skink-mongo against a real
+//          MongoDB server. Skipped (exit 0) unless SKINK_MONGO_DSN is
+//          set — test_live.sh starts a podman mongo:7 container and
+//          exports it.
+//
+//          Exercises for real: OP_MSG hello, SCRAM-SHA-256 auth (Mongo
+//          6+ default), find with multi-batch cursors, insert (kind-1
+//          doc sequences), update, delete, error replies, ping.
+module main
+
+import "mongo_bson"
+import "mongo_conn"
+import "mod/markoxley/skink-dbx/dbx_dsn"
+import "std/str"
+import "std/os"
+import "std/errors"
+
+var failures = 0
+
+fn check(ok: bool, what: string) {
+    if !ok {
+        println("FAIL:", what)
+        failures = failures + 1
+    }
+}
+
+fn expectErr(e: errors.Error, what: string) {
+    if str.Len(e.message) > 0 {
+        check(false, str.Concat(what, str.Concat(" -> ", e.message)))
+    }
+}
+
+fn main() -> int {
+    dsn := os.Getenv("SKINK_MONGO_DSN")
+    if str.Len(dsn) == 0 {
+        println("SKIP live_test: SKINK_MONGO_DSN not set")
+        return 0
+    }
+    println("live test against", dsn)
+
+    info, perr := dbx_dsn.ParseDSN(dsn)
+    if str.Len(perr.message) > 0 {
+        println("FAIL: dsn parse", perr.message)
+        return 1
+    }
+    c, err := mongo_conn.Connect(info)
+    expectErr(err, "connect (SCRAM-SHA-256)")
+    if str.Len(err.message) > 0 {
+        return 1
+    }
+    check(c.MaxWire >= 17, "wire version >= 17")
+    check(c.Authed, "authenticated")
+
+    // Clean slate.
+    mongo_conn.Delete(&c, "skink_live", []mongo_bson.Val{
+        mongo_bson.Doc([]string{"q", "limit"},
+            []mongo_bson.Val{mongo_bson.Doc([]string{}, []mongo_bson.Val{}),
+                mongo_bson.VInt(int64(0))}),
+    })
+
+    // Insert 5 docs.
+    var docs []mongo_bson.Val
+    for i := 0; i < 5; i = i + 1 {
+        docs = append(docs, mongo_bson.Doc([]string{"n", "grp"},
+            []mongo_bson.Val{
+                mongo_bson.VInt(int64(i)),
+                mongo_bson.VStr(str.Concat("g", mongo_bson.Itoa64(int64(i % 2)))),
+            }))
+    }
+    n, ierr := mongo_conn.Insert(&c, "skink_live", docs)
+    expectErr(ierr, "insert")
+    check(n == int64(5), "insert 5")
+
+    // Count.
+    cnt, cerr := mongo_conn.Count(&c, "skink_live",
+        mongo_bson.Doc([]string{}, []mongo_bson.Val{}))
+    expectErr(cerr, "count")
+    check(cnt == int64(5), "count 5")
+
+    // Find with filter.
+    cur, ferr := mongo_conn.Find(&c, "skink_live",
+        mongo_bson.Doc([]string{"grp"}, []mongo_bson.Val{mongo_bson.VStr("g1")}))
+    expectErr(ferr, "find")
+    total := 0
+    for mongo_conn.Next(&cur) {
+        d := mongo_conn.Doc(&cur)
+        v, ok := mongo_bson.Get(d, "grp")
+        check(ok && str.Equal(v.Str, "g1"), "doc has grp=g1")
+        total = total + 1
+    }
+    check(total == 2, "find returned 2")
+
+    // Update.
+    upd := mongo_bson.Doc([]string{"q", "u", "multi"},
+        []mongo_bson.Val{
+            mongo_bson.Doc([]string{"grp"}, []mongo_bson.Val{mongo_bson.VStr("g0")}),
+            mongo_bson.Doc([]string{"$set"}, []mongo_bson.Val{
+                mongo_bson.Doc([]string{"tagged"}, []mongo_bson.Val{mongo_bson.VBool(true)})}),
+            mongo_bson.VBool(true),
+        })
+    un, uerr := mongo_conn.Update(&c, "skink_live", []mongo_bson.Val{upd})
+    expectErr(uerr, "update")
+    check(un == int64(3), "update 3")
+
+    // Delete one.
+    dn, derr := mongo_conn.Delete(&c, "skink_live", []mongo_bson.Val{
+        mongo_bson.Doc([]string{"q", "limit"},
+            []mongo_bson.Val{
+                mongo_bson.Doc([]string{"n"}, []mongo_bson.Val{mongo_bson.VInt(int64(0))}),
+                mongo_bson.VInt(int64(1)),
+            }),
+    })
+    expectErr(derr, "delete")
+    check(dn == int64(1), "delete 1")
+
+    // Error surfaces.
+    _, eerr := mongo_conn.RunCommand(&c, c.Db, mongo_bson.Doc(
+        []string{"bogusCmd"}, []mongo_bson.Val{mongo_bson.VInt(int64(1))}))
+    check(str.Len(eerr.message) > 0, "error surfaces")
+
+    expectErr(mongo_conn.Ping(&c), "ping")
+    mongo_conn.Close(&c)
+
+    if failures > 0 {
+        println("FAILURES:", failures)
+        return 1
+    }
+    println("live test OK")
+    return 0
+}

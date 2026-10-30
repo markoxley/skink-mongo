@@ -1,0 +1,18 @@
+# Skink Project Manifest (managed by scales)
+
+[package]
+name = "mongo"
+version = "0.1.0"
+author = "mark"
+entry = "mongo.skink"
+description = "MongoDB driver for Skink: pure-Skink BSON codec + OP_MSG wire protocol, SCRAM-SHA-1/SHA-256 auth, find/insert/update/delete with cursors, and a dbx driver adapter"
+license = "Apache-2.0"
+
+[target]
+env = "std"
+no_std = false
+os = "any"
+arch = "any"
+
+[dependencies]
+"mod/markoxley/skink-dbx" = "0.1.0"

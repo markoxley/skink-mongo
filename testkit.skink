@@ -1,0 +1,292 @@
+// File:    testkit.skink
+// Purpose: In-process fake MongoDB backend for unit tests. Accepts one
+//          OP_MSG connection; for each request decodes the kind-0 body
+//          doc and hands it to a responder fn that returns the reply
+//          document (headers/sequence numbers handled automatically).
+//
+//          When a responder is nil and the command is saslStart/
+//          saslContinue, the built-in SCRAM-SHA-256 *server* side runs:
+//          real PBKDF2/HMAC/SHA-256 — so client auth is verified
+//          cryptographically, not stubbed.
+//
+//          Kept out of the *_test.skink naming scheme — the harness
+//          treats those as standalone suites.
+module testkit
+
+import "std/str"
+import "std/libc"
+import "std/net"
+import "std/errors"
+import "std/waitgroup"
+import "std/base64"
+import "std/crypto"
+import "mod/markoxley/skink-dbx/dbx_bufconn"
+import "mongo_bson"
+import "mongo_msg"
+
+extern fn SHA256(d: string, n: int64, md: string) -> string
+extern fn memcmp(a: string, b: string, n: int64) -> int
+
+// FakeServer is a scripted MongoDB backend on one loopback port.
+pub struct FakeServer {
+    listener: net.Connection
+    Port:     int
+}
+
+// Reply is what a responder returns for one command doc.
+pub struct Reply {
+    Doc:  mongo_bson.Val
+    Err:  string // non-empty → {ok:0, errmsg:Err}
+}
+
+// ScramCfg holds the fake's credentials for server-side SCRAM.
+pub struct ScramCfg {
+    User:     string
+    Password: string   // plaintext (SHA-256 mode) — MD5-digest for SHA-1 not needed in tests
+    Salt:     string   // raw bytes
+    SaltLen:  int
+    Iters:    int
+}
+
+var scramCfg ScramCfg
+var scramActive = false
+
+// EnableScram arms the built-in SCRAM-SHA-256 server side.
+pub fn EnableScram(user: string, password: string, salt: string, iters: int) {
+    scramCfg = ScramCfg{User: user, Password: password,
+        Salt: salt, SaltLen: str.Len(salt), Iters: iters}
+    scramActive = true
+}
+
+// ---- server-side SCRAM-SHA-256 ------------------------------------------
+
+// hmac256 returns HMAC-SHA256(key, msg) as 32 bytes.
+fn hmac256(key: string, klen: int, msg: string, mlen: int) -> string {
+    return crypto.HmacSha256Bytes(key, klen, msg, mlen)
+}
+
+// sha256 returns the 32-byte digest.
+fn sha256b(d: string, n: int) -> string {
+    out := libc.malloc(33)
+    SHA256(d, int64(n), out)
+    out[32] = 0
+    return out
+}
+
+// hi computes PBKDF2-HMAC-SHA256 (single 32-byte block).
+fn hi(pw: string, salt: string, saltLen: int, iters: int) -> string {
+    block := libc.malloc(saltLen + 4)
+    libc.memcpy(block, salt, saltLen)
+    block[saltLen] = 0
+    block[saltLen + 1] = 0
+    block[saltLen + 2] = 0
+    block[saltLen + 3] = 1
+    u := hmac256(pw, str.Len(pw), block, saltLen + 4)
+    libc.free(block)
+    t := libc.malloc(33)
+    libc.memcpy(t, u, 32)
+    for i := 1; i < iters; i = i + 1 {
+        n2 := hmac256(pw, str.Len(pw), u, 32)
+        libc.free(u)
+        u = n2
+        for j := 0; j < 32; j = j + 1 {
+            t[j] = t[j] ^ u[j]
+        }
+    }
+    libc.free(u)
+    t[32] = 0
+    return t
+}
+
+// fieldGet extracts "k=v" field v from a SCRAM message (text).
+fn fieldGet(msg: string, key: string) -> string {
+    n := str.Len(msg)
+    kl := str.Len(key)
+    for i := 0; i + kl < n; i = i + 1 {
+        hit := true
+        for j := 0; j < kl; j = j + 1 {
+            if msg[i + j] != key[j] {
+                hit = false
+                break
+            }
+        }
+        if hit && (i == 0 || msg[i - 1] == 44) && msg[i + kl] == 61 {
+            stop := i + kl + 1
+            for stop < n && msg[stop] != 44 {
+                stop = stop + 1
+            }
+            return str.Substr(msg, i + kl + 1, stop - (i + kl + 1))
+        }
+    }
+    return ""
+}
+
+// stripProof removes ",p=..." from a client-final message to leave the
+// "without-proof" form used in the AuthMessage.
+fn stripProof(msg: string) -> string {
+    n := str.Len(msg)
+    for i := n - 1; i >= 0; i = i - 1 {
+        if msg[i] == 44 && i + 1 < n && msg[i + 1] == 112 && i + 2 < n && msg[i + 2] == 61 {
+            return str.Substr(msg, 0, i)
+        }
+    }
+    return msg
+}
+
+// scramServer runs the full exchange inside the fake. Returns the
+// reply doc for a saslStart/saslContinue request.
+var srvNonce = ""
+var srvClientFirstBare = ""
+var srvServerFirst = ""
+var srvStoredKey = ""
+var srvServerKey = ""
+var srvConv = 0
+
+fn scramReply(doc: mongo_bson.Val) -> mongo_bson.Val {
+    cmdv, _ := mongo_bson.Get(doc, "saslStart")
+    isStart := cmdv.Kind == mongo_bson.E_INT32 || cmdv.Kind == mongo_bson.E_INT64
+    pv, _ := mongo_bson.Get(doc, "payload")
+    payload := ""
+    if pv.Kind == mongo_bson.E_BINARY {
+        payload = str.Substr(pv.Bytes, 0, pv.Len)
+    }
+    if isStart {
+        // client-first: "n,,n=user,r=nonce"
+        srvClientFirstBare = str.Substr(payload, 3, str.Len(payload) - 3)
+        srvNonce = str.Concat(fieldGet(srvClientFirstBare, "r"), "srvnonce42")
+        salt64 := base64.Encode(scramCfg.Salt, scramCfg.SaltLen)
+        srvServerFirst = str.Concat("r=", str.Concat(srvNonce,
+            str.Concat(",s=", str.Concat(salt64,
+                str.Concat(",i=", mongo_bson.Itoa64(int64(scramCfg.Iters)))))))
+        // Precompute keys from the stored password.
+        salted := hi(scramCfg.Password, scramCfg.Salt, scramCfg.SaltLen, scramCfg.Iters)
+        ck := hmac256(salted, 32, "Client Key", 10)
+        srvStoredKey = sha256b(ck, 32)
+        libc.free(ck)
+        srvServerKey = hmac256(salted, 32, "Server Key", 10)
+        libc.free(salted)
+        srvConv = 12345
+        return mongo_bson.Doc(
+            []string{"conversationId", "done", "payload", "ok"},
+            []mongo_bson.Val{
+                mongo_bson.VInt(int64(srvConv)),
+                mongo_bson.VBool(false),
+                mongo_bson.VBinary(srvServerFirst, str.Len(srvServerFirst), 0),
+                mongo_bson.VDouble(1.0),
+            })
+    }
+    // saslContinue: client-final "c=biws,r=...,p=..."
+    cfBare := stripProof(payload)
+    proof64 := fieldGet(payload, "p")
+    authMsg := str.Concat(srvClientFirstBare, str.Concat(",",
+        str.Concat(srvServerFirst, str.Concat(",", cfBare))))
+    cSig := hmac256(srvStoredKey, 32, authMsg, str.Len(authMsg))
+    proof, derr := base64.Decode(proof64)
+    if str.Len(derr.message) > 0 {
+        return mongo_bson.Doc([]string{"ok", "errmsg"},
+            []mongo_bson.Val{mongo_bson.VDouble(0.0),
+                mongo_bson.VStr("bad proof encoding")})
+    }
+    // Recover ClientKey = proof XOR clientSignature; verify hash.
+    ck := libc.malloc(32)
+    for i := 0; i < 32; i = i + 1 {
+        ck[i] = proof[i] ^ cSig[i]
+    }
+    h := sha256b(ck, 32)
+    okReply := mongo_bson.Doc([]string{"ok", "errmsg"},
+        []mongo_bson.Val{mongo_bson.VDouble(0.0),
+            mongo_bson.VStr("auth failed")})
+    good := memcmp(h, srvStoredKey, int64(32)) == 0
+    libc.free(ck)
+    libc.free(h)
+    libc.free(cSig)
+    if !good {
+        return okReply
+    }
+    sSig := hmac256(srvServerKey, 32, authMsg, str.Len(authMsg))
+    final := str.Concat("v=", base64.Encode(sSig, 32))
+    libc.free(sSig)
+    return mongo_bson.Doc(
+        []string{"conversationId", "done", "payload", "ok"},
+        []mongo_bson.Val{
+            mongo_bson.VInt(int64(srvConv)),
+            mongo_bson.VBool(true),
+            mongo_bson.VBinary(final, str.Len(final), 0),
+            mongo_bson.VDouble(1.0),
+        })
+}
+
+// ---- server loop -----------------------------------------------------------
+
+// docHas reports whether the doc has a leading int field named key.
+fn docHas(doc: mongo_bson.Val, key: string) -> bool {
+    _, ok := mongo_bson.Get(doc, key)
+    return ok
+}
+
+// Serve accepts one connection and serves `turns` command messages.
+// When scram is armed, sasl* commands are handled internally before the
+// responder sees them.
+pub fn Serve(fs: *FakeServer, turns: int,
+        respond: fn(mongo_bson.Val) -> Reply, wg: *waitgroup.WaitGroup) {
+    conn, err := net.Accept(fs.listener)
+    if str.Len(err.message) > 0 {
+        waitgroup.Done(wg)
+        return
+    }
+    bc := dbx_bufconn.Wrap(conn, "127.0.0.1", fs.Port)
+    for i := 0; i < turns; i = i + 1 {
+        m, rerr := mongo_msg.Recv(&bc)
+        if str.Len(rerr.message) > 0 {
+            break
+        }
+        var reply Reply
+        if scramActive && (docHas(m.Body, "saslStart") || docHas(m.Body, "saslContinue")) {
+            reply = Reply{Doc: scramReply(m.Body)}
+        } else {
+            reply = respond(m.Body)
+        }
+        out := reply.Doc
+        if str.Len(reply.Err) > 0 {
+            out = mongo_bson.Doc([]string{"ok", "errmsg"},
+                []mongo_bson.Val{mongo_bson.VDouble(0.0), mongo_bson.VStr(reply.Err)})
+        }
+        werr := sendReply(&bc, m.ReqID, out)
+        if str.Len(werr.message) > 0 {
+            break
+        }
+    }
+    bc.Close()
+    fs.listener.Close()
+    waitgroup.Done(wg)
+}
+
+// sendReply writes one OP_MSG response doc.
+fn sendReply(bc: *dbx_bufconn.BufConn, respTo: int, doc: mongo_bson.Val) -> errors.Error {
+    payload, pn := mongo_bson.Encode(doc)
+    b := mongo_bson.NewOutBuf(pn + 21)
+    mongo_bson.I32(&b, 0)
+    mongo_bson.I32(&b, 1)      // server response id
+    mongo_bson.I32(&b, respTo)
+    mongo_bson.I32(&b, mongo_msg.OP_MSG)
+    mongo_bson.I32(&b, 0)
+    mongo_bson.Byte(&b, 0)
+    mongo_bson.WriteN(&b, payload, pn)
+    mongo_bson.PatchI32(&b, 0, b.Len)
+    err := bc.WriteAll(b.Buf, b.Len)
+    libc.free(payload)
+    mongo_bson.Free(&b)
+    return err
+}
+
+// StartFakeServer listens on a loopback port and returns the server
+// plus an armed waitgroup — callers spawn Serve then dial.
+pub fn StartFakeServer(port: int) -> (FakeServer, *waitgroup.WaitGroup, errors.Error) {
+    listener, err := net.Listen("127.0.0.1", port)
+    if str.Len(err.message) > 0 {
+        return FakeServer{}, nil, err
+    }
+    wg := waitgroup.New()
+    waitgroup.Add(wg, 1)
+    return FakeServer{listener: listener, Port: port}, wg, errors.New("")
+}

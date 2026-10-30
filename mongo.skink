@@ -1,0 +1,66 @@
+// File:    mongo.skink
+// Purpose: Root module for skink-mongo. Re-exports the connection,
+//          BSON builders, and adapter entry points so applications
+//          need only `import "mod/markoxley/skink-mongo"`. Call
+//          mongo.Register() once to make "mongodb://" DSNs work
+//          through the generic dbx.Open entry point.
+module mongo
+
+import "mongo_bson"
+import "mongo_conn"
+import "mongo_dbx"
+import "mod/markoxley/skink-dbx/dbx_dsn"
+import "mod/markoxley/skink-dbx/dbx_value"
+import "std/str"
+import "std/errors"
+
+// Connect opens a connection from a parsed ConnInfo.
+// DSN form:
+//   mongodb://[user[:pass]@]host[:port][/db][?authSource=db&authMechanism=SCRAM-SHA-1|SCRAM-SHA-256&tls=true]
+pub fn Connect(info: dbx_dsn.ConnInfo) -> (mongo_conn.Conn, errors.Error) {
+    return mongo_conn.Connect(info)
+}
+
+// Dial parses a mongodb:// DSN and connects.
+pub fn Dial(dsn: string) -> (mongo_conn.Conn, errors.Error) {
+    info, err := dbx_dsn.ParseDSN(dsn)
+    if str.Len(err.message) > 0 {
+        return mongo_conn.Conn{}, err
+    }
+    return mongo_conn.Connect(info)
+}
+
+// RunCommand sends an arbitrary command document to a database.
+pub fn RunCommand(c: *mongo_conn.Conn, db: string, body: mongo_bson.Val) -> (mongo_bson.Val, errors.Error) {
+    return mongo_conn.RunCommand(c, db, body)
+}
+
+// Find queries coll with a filter doc, returning a cursor.
+pub fn Find(c: *mongo_conn.Conn, coll: string, filter: mongo_bson.Val) -> (mongo_conn.Cursor, errors.Error) {
+    return mongo_conn.Find(c, coll, filter)
+}
+
+// Insert inserts docs into coll, returning the count.
+pub fn Insert(c: *mongo_conn.Conn, coll: string, docs: []mongo_bson.Val) -> (int64, errors.Error) {
+    return mongo_conn.Insert(c, coll, docs)
+}
+
+// Update applies {q,u,multi,upsert} docs to coll.
+pub fn Update(c: *mongo_conn.Conn, coll: string, updates: []mongo_bson.Val) -> (int64, errors.Error) {
+    return mongo_conn.Update(c, coll, updates)
+}
+
+// Delete applies {q,limit} docs to coll.
+pub fn Delete(c: *mongo_conn.Conn, coll: string, deletes: []mongo_bson.Val) -> (int64, errors.Error) {
+    return mongo_conn.Delete(c, coll, deletes)
+}
+
+// Ping runs {ping:1} on admin.
+pub fn Ping(c: *mongo_conn.Conn) -> errors.Error {
+    return mongo_conn.Ping(c)
+}
+
+// Register installs the "mongodb" driver into the dbx registry.
+pub fn Register() {
+    mongo_dbx.Register()
+}

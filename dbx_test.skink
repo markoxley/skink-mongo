@@ -1,0 +1,94 @@
+// File:    dbx_test.skink
+// Purpose: Tests for the mongo_dbx adapter — driver registration,
+//          dbx.Open dispatch, JSON command parsing, row flattening of
+//          cursor batches, Exec affected counts, Begin rejection.
+module dbx_test
+
+import "mongo_bson"
+import "mongo_conn"
+import "mongo_dbx"
+import "testkit"
+import "mod/markoxley/skink-dbx/dbx_driver"
+import "mod/markoxley/skink-dbx/dbx_value"
+import "std/str"
+import "std/testing"
+import "std/waitgroup"
+import "std/errors"
+
+fn firstKey2(doc: mongo_bson.Val) -> string {
+    if len(doc.Keys) == 0 {
+        return ""
+    }
+    return doc.Keys[0]
+}
+
+var lastDoc2 mongo_bson.Val
+
+// dbxResponder answers hello then the scripted command.
+fn dbxResponder(doc: mongo_bson.Val) -> testkit.Reply {
+    lastDoc2 = doc
+    name := firstKey2(doc)
+    if str.Equal(name, "hello") || str.Equal(name, "ismaster") || str.Equal(name, "ping") {
+        return testkit.Reply{Doc: mongo_bson.Doc(
+            []string{"maxWireVersion", "ok"},
+            []mongo_bson.Val{mongo_bson.VInt(int64(17)), mongo_bson.VDouble(1.0)})}
+    }
+    if str.Equal(name, "find") {
+        batch := mongo_bson.Arr([]mongo_bson.Val{
+            mongo_bson.Doc([]string{"_id", "n"},
+                []mongo_bson.Val{mongo_bson.VInt(int64(5)), mongo_bson.VStr("zed")}),
+        })
+        cur := mongo_bson.Doc([]string{"id", "firstBatch"},
+            []mongo_bson.Val{mongo_bson.VLong(int64(0)), batch})
+        return testkit.Reply{Doc: mongo_bson.Doc([]string{"cursor", "ok"},
+            []mongo_bson.Val{cur, mongo_bson.VDouble(1.0)})}
+    }
+    return testkit.Reply{Doc: mongo_bson.Doc([]string{"n", "ok"},
+        []mongo_bson.Val{mongo_bson.VInt(int64(3)), mongo_bson.VDouble(1.0)})}
+}
+
+// TestOpenQueryJson runs dbx.Open → Query(JSON cmd) through the fake.
+pub fn TestOpenQueryJson() {
+    fs, wg, _ := testkit.StartFakeServer(15711)
+    spawn testkit.Serve(&fs, 2, dbxResponder, wg)
+    mongo_dbx.Register()
+    conn, err := dbx_driver.Open("mongodb://127.0.0.1:15711/app")
+    testing.AssertTrue(str.Len(err.message) == 0, str.Concat("open: ", err.message))
+    testing.AssertEqualString("mongodb", conn.Name, "driver name")
+
+    rows, qerr := conn.Query(`{"find":"items","filter":{"kind":"x"}}`, []dbx_value.Value{})
+    testing.AssertTrue(str.Len(qerr.message) == 0, str.Concat("query: ", qerr.message))
+    testing.AssertTrue(rows.Next(), "has row")
+    testing.AssertTrue(rows.Int64("_id") == int64(5), "_id value")
+    testing.AssertEqualString("zed", rows.String("n"), "n value")
+    conn.Close()
+    waitgroup.Wait(wg)
+}
+
+// TestExecJson covers Exec(JSON cmd) returning the n field.
+pub fn TestExecJson() {
+    fs, wg, _ := testkit.StartFakeServer(15712)
+    spawn testkit.Serve(&fs, 2, dbxResponder, wg)
+    mongo_dbx.Register()
+    conn, _ := dbx_driver.Open("mongodb://127.0.0.1:15712/app")
+    n, err := conn.Exec(`{"delete":"t","deletes":[{"q":{},"limit":0}]}`, []dbx_value.Value{})
+    testing.AssertTrue(str.Len(err.message) == 0, "exec")
+    testing.AssertTrue(n == int64(3), "delete n")
+    // The $db field was appended to the command.
+    dbv, ok := mongo_bson.Get(lastDoc2, "$db")
+    testing.AssertTrue(ok && str.Equal(dbv.Str, "app"), "$db attached")
+    conn.Close()
+    waitgroup.Wait(wg)
+}
+
+// TestBeginUnsupported confirms Begin reports unsupported.
+pub fn TestBeginUnsupported() {
+    fs, wg, _ := testkit.StartFakeServer(15713)
+    spawn testkit.Serve(&fs, 1, dbxResponder, wg)
+    mongo_dbx.Register()
+    conn, _ := dbx_driver.Open("mongodb://127.0.0.1:15713/app")
+    _, err := conn.Begin()
+    testing.AssertTrue(str.Len(err.message) > 0, "begin rejected")
+    conn.Close()
+    waitgroup.Wait(wg)
+}

@@ -1,0 +1,363 @@
+// File:    mongo_dbx.skink
+// Purpose: dbx driver adapter for MongoDB. Registers a dbx.Driver
+//          under "mongodb" so dbx.Open("mongodb://...") works. Since
+//          MongoDB has no SQL, Conn.Query/Exec take a JSON command
+//          document: '{"find":"coll","filter":{"x":1}}'. Replies map
+//          to rows as follows:
+//            - cursor.firstBatch/nextBatch docs → one row per document
+//              with the union of field names as columns (missing → NULL)
+//            - any other reply → a single row over the reply's fields
+//          Exec returns the reply's "n" field when present.
+//          Transactions are unsupported (needs sessions) — Begin
+//          returns an error.
+module mongo_dbx
+
+import "std/str"
+import "std/libc"
+import "std/errors"
+import "std/json"
+import "std/strconv"
+import "mod/markoxley/skink-dbx/dbx_driver"
+import "mod/markoxley/skink-dbx/dbx_dsn"
+import "mod/markoxley/skink-dbx/dbx_value"
+import "mod/markoxley/skink-dbx/dbx_rows"
+import "mongo_conn"
+import "mongo_bson"
+
+// ---- handle registry (Skink cannot cast int64 back to *Conn) ---------
+
+var nextHandle = 0
+var handles = make(map[int]*mongo_conn.Conn)
+
+// boxConn stores a connection and returns its handle.
+fn boxConn(c: mongo_conn.Conn) -> int64 {
+    nextHandle = nextHandle + 1
+    p := &mongo_conn.Conn{}
+    *p = c
+    handles[nextHandle] = p
+    return int64(nextHandle)
+}
+
+// unbox returns the stored connection for a handle.
+fn unbox(h: int64) -> *mongo_conn.Conn {
+    p, ok := handles[int(h)]
+    if !ok {
+        return nil
+    }
+    return p
+}
+
+// drop removes a handle.
+fn drop(h: int64) {
+    _, ok := handles[int(h)]
+    if ok {
+        delete(handles, int(h))
+    }
+}
+
+// ---- json.Value → bson.Val -------------------------------------------------
+
+// jsonToBson converts a parsed JSON value into BSON. Numbers become
+// int32/int64 when integral, otherwise double; objects keep member
+// order (json.Value preserves it).
+fn jsonToBson(v: json.Value) -> mongo_bson.Val {
+    if json.IsNull(v) {
+        return mongo_bson.VNull()
+    }
+    switch json.Kind(v) {
+        case json.KIND_BOOL:
+            return mongo_bson.VBool(json.AsBool(v))
+        case json.KIND_NUMBER:
+            n := json.AsNumber(v)
+            if n == float(int64(n)) {
+                return mongo_bson.VInt(int64(n))
+            }
+            return mongo_bson.VDouble(n)
+        case json.KIND_STRING:
+            return mongo_bson.VStr(json.AsString(v))
+        case json.KIND_ARRAY:
+            var vals []mongo_bson.Val
+            for i := 0; i < json.ArrayLen(v); i = i + 1 {
+                vals = append(vals, jsonToBson(json.ArrayGet(v, i)))
+            }
+            return mongo_bson.Arr(vals)
+        case json.KIND_OBJECT:
+            var keys []string
+            var vals []mongo_bson.Val
+            for i := 0; i < json.ObjectLen(v); i = i + 1 {
+                k, e := json.ObjectGetByIndex(v, i)
+                keys = append(keys, k)
+                vals = append(vals, jsonToBson(e))
+            }
+            return mongo_bson.Doc(keys, vals)
+        default:
+            return mongo_bson.VNull()
+    }
+    return mongo_bson.VNull()
+}
+
+// parseCmd turns a JSON command string into a BSON document.
+fn parseCmd(cmd: string) -> (mongo_bson.Val, errors.Error) {
+    v, err := json.Unmarshal(cmd)
+    if str.Len(err.message) > 0 {
+        return mongo_bson.Val{}, errors.New(str.Concat("mongo: bad command JSON: ", err.message))
+    }
+    if json.Kind(v) != json.KIND_OBJECT {
+        return mongo_bson.Val{}, errors.New("mongo: command must be a JSON object")
+    }
+    return jsonToBson(v), errors.New("")
+}
+
+// ---- bson → dbx rows --------------------------------------------------------
+
+// bsonToValue maps a BSON element to a dbx_value for row output.
+fn bsonToValue(v: mongo_bson.Val) -> dbx_value.Value {
+    if v.Kind == mongo_bson.E_INT32 || v.Kind == mongo_bson.E_INT64 {
+        return dbx_value.Int(v.I64)
+    }
+    if v.Kind == mongo_bson.E_DOUBLE {
+        return dbx_value.Float(v.Num)
+    }
+    if v.Kind == mongo_bson.E_STRING {
+        return dbx_value.TextN(v.Str, str.Len(v.Str))
+    }
+    if v.Kind == mongo_bson.E_BOOL {
+        return dbx_value.Bool(v.Bool)
+    }
+    if v.Kind == mongo_bson.E_NULL {
+        return dbx_value.Null()
+    }
+    if v.Kind == mongo_bson.E_DATETIME {
+        // BSON datetime is ms → dbx time is µs.
+        return dbx_value.TimeUnixMicros(v.I64 * int64(1000))
+    }
+    if v.Kind == mongo_bson.E_BINARY {
+        return dbx_value.Blob(v.Bytes, v.Len)
+    }
+    if v.Kind == mongo_bson.E_OBJECTID {
+        return dbx_value.Text(objectIdHex(v.Bytes))
+    }
+    // Nested doc/array: marshal to JSON text.
+    return dbx_value.Text(bsonToJsonText(v))
+}
+
+// objectIdHex renders 12 bytes as lowercase hex.
+fn objectIdHex(s: string) -> string {
+    hex := "0123456789abcdef"
+    out := libc.malloc(25)
+    for i := 0; i < 12; i = i + 1 {
+        out[i * 2] = hex[s[i] >> 4]
+        out[i * 2 + 1] = hex[s[i] & 15]
+    }
+    out[24] = 0
+    return out
+}
+
+// bsonToJsonText renders any Val as JSON text (nested docs/arrays).
+fn bsonToJsonText(v: mongo_bson.Val) -> string {
+    if v.Kind == mongo_bson.E_DOC {
+        parts := ""
+        for i := 0; i < len(v.Keys); i = i + 1 {
+            if i > 0 {
+                parts = str.Concat(parts, ",")
+            }
+            parts = str.Concat(parts, str.Concat("\"",
+                str.Concat(v.Keys[i], str.Concat("\":",
+                    bsonToJsonText(v.Arr[i])))))
+        }
+        return str.Concat("{", str.Concat(parts, "}"))
+    }
+    if v.Kind == mongo_bson.E_ARRAY {
+        parts := ""
+        for i := 0; i < len(v.Arr); i = i + 1 {
+            if i > 0 {
+                parts = str.Concat(parts, ",")
+            }
+            parts = str.Concat(parts, bsonToJsonText(v.Arr[i]))
+        }
+        return str.Concat("[", str.Concat(parts, "]"))
+    }
+    if v.Kind == mongo_bson.E_STRING {
+        return str.Concat("\"", str.Concat(v.Str, "\""))
+    }
+    if v.Kind == mongo_bson.E_BOOL {
+        if v.Bool { return "true" }
+        return "false"
+    }
+    if v.Kind == mongo_bson.E_NULL {
+        return "null"
+    }
+    if v.Kind == mongo_bson.E_DOUBLE {
+        return floatText(v.Num)
+    }
+    if v.Kind == mongo_bson.E_INT32 || v.Kind == mongo_bson.E_INT64 ||
+        v.Kind == mongo_bson.E_DATETIME {
+        return mongo_bson.Itoa64(v.I64)
+    }
+    if v.Kind == mongo_bson.E_OBJECTID {
+        return str.Concat("{\"$oid\":\"", str.Concat(objectIdHex(v.Bytes), "\"}"))
+    }
+    return "null"
+}
+
+// floatText renders a double.
+fn floatText(f: float) -> string {
+    return strconvFormat(f)
+}
+
+// strconvFormat — shortest round-trip float formatting via strconv.
+fn strconvFormat(v: float) -> string {
+    p := 0
+    for p <= 17 {
+        s := strconv.FormatFloat(v, p)
+        pv, ok := strconv.ParseFloat(s)
+        if ok && pv == v {
+            return s
+        }
+        p = p + 1
+    }
+    return strconv.FormatFloat(v, 17)
+}
+
+// flattenRows turns a command reply into columnar rows: cursor
+// batches → one row per doc (union columns); plain replies → one row.
+fn flattenRows(reply: mongo_bson.Val) -> dbx_rows.Rows {
+    docs, ok := batchDocs(reply)
+    if !ok {
+        // Single-row reply over the top-level fields.
+        return dbx_rows.NewRows(reply.Keys, [][]dbx_value.Value{docToRow(reply, reply.Keys)})
+    }
+    // Union of field names across the batch, first-seen order.
+    var cols []string
+    for i := 0; i < len(docs); i = i + 1 {
+        for j := 0; j < len(docs[i].Keys); j = j + 1 {
+            k := docs[i].Keys[j]
+            found := false
+            for m := 0; m < len(cols); m = m + 1 {
+                if str.Equal(cols[m], k) {
+                    found = true
+                    break
+                }
+            }
+            if !found {
+                cols = append(cols, k)
+            }
+        }
+    }
+    var data [][]dbx_value.Value
+    for i := 0; i < len(docs); i = i + 1 {
+        data = append(data, docToRow(docs[i], cols))
+    }
+    return dbx_rows.NewRows(cols, data)
+}
+
+// docToRow projects a doc onto the column list.
+fn docToRow(doc: mongo_bson.Val, cols: []string) -> []dbx_value.Value {
+    var row []dbx_value.Value
+    for i := 0; i < len(cols); i = i + 1 {
+        v, ok := mongo_bson.Get(doc, cols[i])
+        if ok {
+            row = append(row, bsonToValue(v))
+        } else {
+            row = append(row, dbx_value.Null())
+        }
+    }
+    return row
+}
+
+// batchDocs extracts cursor.firstBatch/nextBatch documents.
+fn batchDocs(reply: mongo_bson.Val) -> ([]mongo_bson.Val, bool) {
+    v, ok := mongo_bson.Path(reply, "cursor.firstBatch")
+    if !ok {
+        v, ok = mongo_bson.Path(reply, "cursor.nextBatch")
+    }
+    if !ok || v.Kind != mongo_bson.E_ARRAY {
+        return []mongo_bson.Val{}, false
+    }
+    return v.Arr, true
+}
+
+// ---- vtable -----------------------------------------------------------------
+
+fn queryImpl(self: *dbx_driver.Conn, sql: string, args: []dbx_value.Value) -> (dbx_rows.Rows, errors.Error) {
+    c := unbox(self.State)
+    if c == nil {
+        return dbx_rows.EmptyRows([]string{}), errors.New("mongo: bad handle")
+    }
+    cmd, perr := parseCmd(sql)
+    if str.Len(perr.message) > 0 {
+        return dbx_rows.EmptyRows([]string{}), perr
+    }
+    rep, rerr := mongo_conn.RunCommand(c, c.Db, cmd)
+    if str.Len(rerr.message) > 0 {
+        return dbx_rows.EmptyRows([]string{}), rerr
+    }
+    return flattenRows(rep), errors.New("")
+}
+
+fn execImpl(self: *dbx_driver.Conn, sql: string, args: []dbx_value.Value) -> (int64, errors.Error) {
+    c := unbox(self.State)
+    if c == nil {
+        return int64(0), errors.New("mongo: bad handle")
+    }
+    cmd, perr := parseCmd(sql)
+    if str.Len(perr.message) > 0 {
+        return int64(0), perr
+    }
+    rep, rerr := mongo_conn.RunCommand(c, c.Db, cmd)
+    if str.Len(rerr.message) > 0 {
+        return int64(0), rerr
+    }
+    n, ok := mongo_bson.Get(rep, "n")
+    if ok {
+        return n.I64, errors.New("")
+    }
+    nm, ok := mongo_bson.Get(rep, "nModified")
+    if ok {
+        return nm.I64, errors.New("")
+    }
+    return int64(0), errors.New("")
+}
+
+fn pingImpl(self: *dbx_driver.Conn) -> errors.Error {
+    c := unbox(self.State)
+    if c == nil {
+        return errors.New("mongo: bad handle")
+    }
+    return mongo_conn.Ping(c)
+}
+
+fn beginImpl(self: *dbx_driver.Conn) -> (dbx_driver.Tx, errors.Error) {
+    return dbx_driver.Tx{}, errors.New("mongo: transactions are not supported (sessions not implemented)")
+}
+
+fn closeImpl(self: *dbx_driver.Conn) -> errors.Error {
+    c := unbox(self.State)
+    if c == nil {
+        return errors.New("")
+    }
+    mongo_conn.Close(c)
+    drop(self.State)
+    return errors.New("")
+}
+
+// openImpl is the dbx Driver.Open entry point for "mongodb".
+fn openImpl(info: dbx_dsn.ConnInfo) -> (dbx_driver.Conn, errors.Error) {
+    conn, err := mongo_conn.Connect(info)
+    if str.Len(err.message) > 0 {
+        return dbx_driver.Conn{}, err
+    }
+    dc := dbx_driver.Conn{Name: "mongodb", State: boxConn(conn)}
+    dc.queryFn = queryImpl
+    dc.execFn = execImpl
+    dc.pingFn = pingImpl
+    dc.beginFn = beginImpl
+    dc.closeFn = closeImpl
+    return dc, errors.New("")
+}
+
+// Register installs the MongoDB driver into the dbx registry so
+// dbx.Open("mongodb://...") works.
+pub fn Register() {
+    dbx_driver.RegisterDriver(dbx_driver.Driver{Name: "mongodb", Open: openImpl})
+}

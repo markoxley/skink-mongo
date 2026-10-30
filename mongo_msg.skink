@@ -1,0 +1,161 @@
+// File:    mongo_msg.skink
+// Purpose: OP_MSG wire framing for MongoDB (opcode 2013, wire version
+//          6+, i.e. server >= 3.6). A message is
+//            int32 msgLen | int32 reqID | int32 respTo | int32 opcode
+//            u32 flags | section*
+//          Sections: kind 0 = one BSON body doc; kind 1 = a document
+//          sequence (identifier cstring + i32 size + docs) used for
+//          bulk payloads. Outgoing messages use kind 0 for the command
+//          and kind 1 for insert document streams when requested.
+//
+//          A trailing 4-byte CRC-32C (flag bit 0) is accepted and
+//          stripped, not verified — the checksum exists for
+//          storage-engine integrity; TLS already covers the wire.
+module mongo_msg
+
+import "std/str"
+import "std/libc"
+import "std/errors"
+import "mod/markoxley/skink-dbx/dbx_bufconn"
+import "mongo_bson"
+
+pub const OP_MSG  = 2013
+pub const OP_REPLY = 1 // legacy reply opcode (never sent, kept for ref)
+
+// request counter — message ids only need to be unique per connection.
+var nextReq = 0
+
+// NextReqID returns a fresh request id.
+pub fn NextReqID() -> int {
+    nextReq = nextReq + 1
+    if nextReq > 2000000000 {
+        nextReq = 1
+    }
+    return nextReq
+}
+
+// Msg is one decoded OP_MSG: the body doc plus any document sequences.
+pub struct Msg {
+    ReqID:    int
+    RespTo:   int
+    Flags:    int
+    Body:     mongo_bson.Val   // kind-0 section
+    SeqIds:   []string         // kind-1 section identifiers
+    SeqDocs:  [][]mongo_bson.Val // parallel doc lists
+    MoreComing: bool
+}
+
+// SendBody writes an OP_MSG carrying one kind-0 document body.
+pub fn SendBody(bc: *dbx_bufconn.BufConn, reqID: int, body: mongo_bson.Val) -> errors.Error {
+    payload, pn := mongo_bson.Encode(body)
+    b := mongo_bson.NewOutBuf(pn + 21)
+    mongo_bson.I32(&b, 0)          // msgLen placeholder
+    mongo_bson.I32(&b, reqID)
+    mongo_bson.I32(&b, 0)          // responseTo
+    mongo_bson.I32(&b, OP_MSG)
+    mongo_bson.I32(&b, 0)          // flags
+    mongo_bson.Byte(&b, 0)         // section kind 0
+    mongo_bson.WriteN(&b, payload, pn)
+    mongo_bson.PatchI32(&b, 0, b.Len)
+    err := bc.WriteAll(b.Buf, b.Len)
+    libc.free(payload)
+    mongo_bson.Free(&b)
+    return err
+}
+
+// SendBodySeq writes an OP_MSG with a kind-0 body plus one kind-1
+// document sequence (e.g. "documents" for insert).
+pub fn SendBodySeq(bc: *dbx_bufconn.BufConn, reqID: int, body: mongo_bson.Val,
+        seqName: string, docs: []mongo_bson.Val) -> errors.Error {
+    payload, pn := mongo_bson.Encode(body)
+    b := mongo_bson.NewOutBuf(pn + 64)
+    mongo_bson.I32(&b, 0)
+    mongo_bson.I32(&b, reqID)
+    mongo_bson.I32(&b, 0)
+    mongo_bson.I32(&b, OP_MSG)
+    mongo_bson.I32(&b, 0)
+    mongo_bson.Byte(&b, 0)
+    mongo_bson.WriteN(&b, payload, pn)
+    libc.free(payload)
+    // kind-1 document sequence: i32 size | cstring id | doc*
+    mongo_bson.Byte(&b, 1)
+    seqStart := b.Len
+    mongo_bson.I32(&b, 0)
+    mongo_bson.CStr(&b, seqName)
+    for i := 0; i < len(docs); i = i + 1 {
+        d, dn := mongo_bson.Encode(docs[i])
+        mongo_bson.WriteN(&b, d, dn)
+        libc.free(d)
+    }
+    mongo_bson.PatchI32(&b, seqStart, b.Len - seqStart)
+    mongo_bson.PatchI32(&b, 0, b.Len)
+    err := bc.WriteAll(b.Buf, b.Len)
+    mongo_bson.Free(&b)
+    return err
+}
+
+// Recv reads one OP_MSG and parses sections. Only kind 0 and kind 1
+// sections are understood; a trailing CRC is dropped.
+pub fn Recv(bc: *dbx_bufconn.BufConn) -> (Msg, errors.Error) {
+    m := Msg{}
+    hdr, herr := bc.ReadN(4)
+    if str.Len(herr.message) > 0 {
+        return m, herr
+    }
+    r := mongo_bson.NewReader(hdr, 4)
+    total := mongo_bson.RI32(&r)
+    if total < 21 || total > 48000000 {
+        return m, errors.New("mongo: implausible message length")
+    }
+    rest, rerr := bc.ReadN(total - 4)
+    if str.Len(rerr.message) > 0 {
+        return m, rerr
+    }
+    rn := total - 4
+    br := mongo_bson.NewReader(rest, rn)
+    m.ReqID = mongo_bson.RI32(&br)
+    m.RespTo = mongo_bson.RI32(&br)
+    op := mongo_bson.RI32(&br)
+    if op != OP_MSG {
+        return m, errors.New(str.Concat("mongo: unexpected opcode ",
+            mongo_bson.Itoa64(int64(op))))
+    }
+    m.Flags = mongo_bson.RI32(&br)
+    m.MoreComing = (m.Flags & 2) != 0
+    end := rn
+    if (m.Flags & 1) != 0 {
+        end = end - 4 // strip trailing CRC-32C
+    }
+    for br.Pos < end {
+        kind := int(rest[br.Pos])
+        br.Pos = br.Pos + 1
+        if kind == 0 {
+            doc, derr := mongo_bson.Decode(&br)
+            if str.Len(derr.message) > 0 {
+                return m, derr
+            }
+            m.Body = doc
+        } else if kind == 1 {
+            seqSize := mongo_bson.RI32(&br)
+            seqEnd := br.Pos - 4 + seqSize
+            if seqEnd > end {
+                return m, errors.New("mongo: doc sequence overruns message")
+            }
+            id := mongo_bson.RCStr(&br)
+            var docs []mongo_bson.Val
+            for br.Pos < seqEnd {
+                d, derr := mongo_bson.Decode(&br)
+                if str.Len(derr.message) > 0 {
+                    return m, derr
+                }
+                docs = append(docs, d)
+            }
+            m.SeqIds = append(m.SeqIds, id)
+            m.SeqDocs = append(m.SeqDocs, docs)
+        } else {
+            return m, errors.New(str.Concat("mongo: unknown section kind ",
+                mongo_bson.Itoa64(int64(kind))))
+        }
+    }
+    return m, errors.New("")
+}

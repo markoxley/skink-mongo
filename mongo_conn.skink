@@ -1,0 +1,444 @@
+// File:    mongo_conn.skink
+// Purpose: MongoDB connection — OP_MSG hello, SCRAM-SHA-1/SHA-256 auth
+//          over saslStart/saslContinue, runCommand, and CRUD/cursor
+//          helpers. Everything speaks OP_MSG (requires server >= 3.6).
+//
+//          SCRAM runs the dbx_scram client; the SASL payloads ride in
+//          binary (subtype 0) fields of saslStart/saslContinue command
+//          documents sent to the auth database. For SCRAM-SHA-1 the
+//          "password" MongoDB hashes is MD5("user:mongo:pw") hex —
+//          handled transparently here.
+module mongo_conn
+
+import "std/str"
+import "std/libc"
+import "std/errors"
+import "mod/markoxley/skink-dbx/dbx_dsn"
+import "mod/markoxley/skink-dbx/dbx_bufconn"
+import "mod/markoxley/skink-dbx/dbx_scram"
+import "mongo_bson"
+import "mongo_msg"
+
+// libcrypto: SHA1 digest for SCRAM-SHA-1, MD5 for the legacy password
+// digest, SHA256/HMAC for the testkit-free client side is in dbx_scram.
+extern fn MD5(d: string, n: int64, md: string) -> string
+
+// Conn is one MongoDB connection.
+pub struct Conn {
+    Bc:         dbx_bufconn.BufConn
+    Db:         string   // working database (from the DSN path)
+    AuthDb:     string   // database auth ran against
+    ServerVer:  string
+    MaxWire:    int
+    Authed:     bool
+}
+
+// md5Hex returns lowercase hex MD5 of s (the SCRAM-SHA-1 password
+// digest MongoDB expects).
+fn md5Hex(s: string) -> string {
+    out := libc.malloc(16)
+    MD5(s, int64(str.Len(s)), out)
+    hex := "0123456789abcdef"
+    res := libc.malloc(33)
+    for i := 0; i < 16; i = i + 1 {
+        res[i * 2] = hex[out[i] >> 4]
+        res[i * 2 + 1] = hex[out[i] & 15]
+    }
+    res[32] = 0
+    libc.free(out)
+    return res
+}
+
+// cmdDoc wraps a command body with the target database field.
+fn cmdDoc(db: string, keys: []string, vals: []mongo_bson.Val) -> mongo_bson.Val {
+    ks := append(keys, "$db")
+    vs := append(vals, mongo_bson.VStr(db))
+    return mongo_bson.Doc(ks, vs)
+}
+
+// RunCommand sends one command doc to db and returns the reply body.
+// Fails (error, not exception) when the reply's ok field is not 1.
+pub fn RunCommand(c: *Conn, db: string, body: mongo_bson.Val) -> (mongo_bson.Val, errors.Error) {
+    withDb := mongo_bson.Val{Kind: mongo_bson.E_DOC, Keys: body.Keys, Arr: body.Arr}
+    _, hasDb := mongo_bson.Get(withDb, "$db")
+    if !hasDb {
+        withDb.Keys = append(withDb.Keys, "$db")
+        withDb.Arr = append(withDb.Arr, mongo_bson.VStr(db))
+    }
+    serr := mongo_msg.SendBody(&c.Bc, mongo_msg.NextReqID(), withDb)
+    if str.Len(serr.message) > 0 {
+        return mongo_bson.Val{}, serr
+    }
+    m, rerr := mongo_msg.Recv(&c.Bc)
+    if str.Len(rerr.message) > 0 {
+        return mongo_bson.Val{}, rerr
+    }
+    if !mongo_bson.OkField(m.Body) {
+        msg := mongo_bson.ErrMsg(m.Body)
+        if str.Len(msg) == 0 {
+            msg = "command failed"
+        }
+        return m.Body, errors.New(str.Concat("mongo: ", msg))
+    }
+    return m.Body, errors.New("")
+}
+
+// hello performs the initial handshake and fills in server metadata.
+fn hello(c: *Conn) -> errors.Error {
+    body := mongo_bson.Doc([]string{"hello", "helloOk"},
+        []mongo_bson.Val{mongo_bson.VInt(int64(1)), mongo_bson.VBool(true)})
+    rep, err := RunCommand(c, "admin", body)
+    if str.Len(err.message) > 0 {
+        // Pre-5.x servers may not know "hello"; fall back to ismaster.
+        body = mongo_bson.Doc([]string{"ismaster"}, []mongo_bson.Val{mongo_bson.VInt(int64(1))})
+        rep, err = RunCommand(c, "admin", body)
+        if str.Len(err.message) > 0 {
+            return err
+        }
+    }
+    v, ok := mongo_bson.Get(rep, "maxWireVersion")
+    if ok {
+        c.MaxWire = int(v.I64)
+    }
+    v, ok = mongo_bson.Get(rep, "version")
+    if ok && v.Kind == mongo_bson.E_STRING {
+        c.ServerVer = v.Str
+    }
+    return errors.New("")
+}
+
+// authOne runs one SCRAM exchange: saslStart carrying client-first,
+// then saslContinue exchanges until the server reports done. The
+// client-final is sent in the first saslContinue; any further payload
+// the server returns is verified as the server-final signature.
+fn authOne(c: *Conn, authDb: string, user: string, pass: string, sha256: bool) -> errors.Error {
+    scram := dbx_scram.NewScram(user, pass, sha256)
+    mech := dbx_scram.Mechanism(&scram)
+    cf := dbx_scram.ClientFirst(&scram)
+    start := mongo_bson.Doc(
+        []string{"saslStart", "mechanism", "payload", "autoAuthorize"},
+        []mongo_bson.Val{
+            mongo_bson.VInt(int64(1)),
+            mongo_bson.VStr(mech),
+            mongo_bson.VBinary(cf, str.Len(cf), 0),
+            mongo_bson.VInt(int64(1)),
+        })
+    rep, err := RunCommand(c, authDb, start)
+    if str.Len(err.message) > 0 {
+        return err
+    }
+    conv := int64(0)
+    cv, ok := mongo_bson.Get(rep, "conversationId")
+    if ok {
+        conv = cv.I64
+    }
+    pv, ok := mongo_bson.Get(rep, "payload")
+    if !ok || pv.Kind != mongo_bson.E_BINARY {
+        return errors.New("mongo: malformed saslStart reply")
+    }
+    // pv.Bytes may carry a trailing NUL in some implementations — the
+    // explicit Len field is authoritative.
+    cfMsg := copyN(pv.Bytes, pv.Len)
+    clientFinal, ferr := dbx_scram.HandleServerFirst(&scram, cfMsg)
+    libc.free(cfMsg)
+    if str.Len(ferr.message) > 0 {
+        return ferr
+    }
+    outPayload := clientFinal
+    verified := false
+    for rounds := 0; rounds < 8; rounds = rounds + 1 {
+        cont := mongo_bson.Doc(
+            []string{"saslContinue", "conversationId", "payload"},
+            []mongo_bson.Val{
+                mongo_bson.VInt(int64(1)),
+                mongo_bson.VInt(conv),
+                mongo_bson.VBinary(outPayload, str.Len(outPayload), 0),
+            })
+        rep, err = RunCommand(c, authDb, cont)
+        if str.Len(err.message) > 0 {
+            return err
+        }
+        done := false
+        dv, ok2 := mongo_bson.Get(rep, "done")
+        if ok2 {
+            done = dv.Bool || dv.I64 == int64(1)
+        }
+        pv2, ok3 := mongo_bson.Get(rep, "payload")
+        if ok3 && pv2.Kind == mongo_bson.E_BINARY && pv2.Len > 0 && !verified {
+            sf := copyN(pv2.Bytes, pv2.Len)
+            verr := dbx_scram.VerifyServerFinal(&scram, sf)
+            libc.free(sf)
+            if str.Len(verr.message) > 0 {
+                return verr
+            }
+            verified = true
+        }
+        if done {
+            if !verified {
+                // The server finished without a verifiable final
+                // signature — it never proved it knows the password.
+                return errors.New("mongo: server-final signature missing")
+            }
+            return errors.New("")
+        }
+        outPayload = "" // subsequent continuations carry no payload
+    }
+    return errors.New("mongo: sasl conversation exceeded round limit")
+}
+
+// copyN copies n bytes into a fresh NUL-terminated buffer — scram
+// messages are text, but server binary payloads may not be.
+fn copyN(s: string, n: int) -> string {
+    out := libc.malloc(n + 1)
+    libc.memcpy(out, s, n)
+    out[n] = 0
+    return out
+}
+
+// Connect dials, handshakes, and authenticates when the DSN carries a
+// user. DSN form:
+//   mongodb://[user[:pass]@]host[:port][/authDb][?authMechanism=...&tls=true]
+pub fn Connect(info: dbx_dsn.ConnInfo) -> (Conn, errors.Error) {
+    c := Conn{}
+    host := info.Host
+    if str.Len(host) == 0 {
+        host = "localhost"
+    }
+    port := dbx_dsn.PortOr(info, 27017)
+    bc, derr := dbx_bufconn.Dial(host, port, 10000)
+    if str.Len(derr.message) > 0 {
+        return c, derr
+    }
+    c.Bc = bc
+    c.Db = info.Database
+    if str.Len(c.Db) == 0 {
+        c.Db = "test"
+    }
+    c.AuthDb = c.Db
+    authSrc := dbx_dsn.ParamOr(info, "authSource", "")
+    if str.Len(authSrc) > 0 {
+        c.AuthDb = authSrc
+    }
+    ssl := dbx_dsn.ParamOr(info, "tls", dbx_dsn.ParamOr(info, "ssl", ""))
+    if str.Equal(ssl, "true") || str.Equal(ssl, "required") {
+        // Verify the server certificate by default; tls_verify=0 or
+        // insecure_skip_verify=1 is the explicit dev escape hatch.
+        skip := dbx_dsn.ParamOr(info, "insecure_skip_verify",
+            dbx_dsn.ParamOr(info, "tls_verify", ""))
+        verify := !str.Equal(skip, "1") && !str.Equal(skip, "true") &&
+            !str.Equal(skip, "0")
+        terr := c.Bc.StartTLS(verify)
+        if str.Len(terr.message) > 0 {
+            c.Bc.Close()
+            return c, terr
+        }
+    }
+    herr := hello(&c)
+    if str.Len(herr.message) > 0 {
+        c.Bc.Close()
+        return c, herr
+    }
+    if str.Len(info.User) > 0 {
+        _, mechSet := dbx_dsn.Param(info, "authMechanism")
+        mech := str.ToUpper(dbx_dsn.ParamOr(info, "authMechanism", "SCRAM-SHA-256"))
+        if str.Equal(mech, "SCRAM-SHA-1") {
+            // MongoDB SCRAM-SHA-1 hashes the password once with MD5.
+            digest := md5Hex(str.Concat(info.User,
+                str.Concat(":mongo:", info.Password)))
+            aerr := authOne(&c, c.AuthDb, info.User, digest, false)
+            libc.free(digest)
+            if str.Len(aerr.message) > 0 {
+                c.Bc.Close()
+                return c, aerr
+            }
+        } else {
+            aerr := authOne(&c, c.AuthDb, info.User, info.Password, true)
+            if str.Len(aerr.message) > 0 && !mechSet {
+                // If the server only supports SHA-1 (pre-4.0), fall back —
+                // but only when the caller didn't pin the mechanism, so a
+                // deliberate SCRAM-SHA-256 choice can't be downgraded.
+                digest := md5Hex(str.Concat(info.User,
+                    str.Concat(":mongo:", info.Password)))
+                aerr = authOne(&c, c.AuthDb, info.User, digest, false)
+                libc.free(digest)
+            }
+            if str.Len(aerr.message) > 0 {
+                c.Bc.Close()
+                return c, aerr
+            }
+        }
+        c.Authed = true
+    }
+    return c, errors.New("")
+}
+
+// ---- CRUD helpers ------------------------------------------------------------
+
+// Find runs {find: coll, filter: f} and returns the full first batch.
+// For multi-batch results iterate with GetMore using the returned
+// Cursor.
+pub fn Find(c: *Conn, coll: string, filter: mongo_bson.Val) -> (Cursor, errors.Error) {
+    body := mongo_bson.Doc([]string{"find", "filter"},
+        []mongo_bson.Val{mongo_bson.VStr(coll), filter})
+    rep, err := RunCommand(c, c.Db, body)
+    cur := Cursor{Conn: c, Coll: coll}
+    if str.Len(err.message) > 0 {
+        return cur, err
+    }
+    fillCursor(&cur, rep)
+    return cur, errors.New("")
+}
+
+// Insert inserts docs into coll, returning the inserted count.
+pub fn Insert(c: *Conn, coll: string, docs: []mongo_bson.Val) -> (int64, errors.Error) {
+    body := mongo_bson.Doc([]string{"insert"},
+        []mongo_bson.Val{mongo_bson.VStr(coll)})
+    _, hasDb := mongo_bson.Get(body, "$db")
+    if !hasDb {
+        body.Keys = append(body.Keys, "$db")
+        body.Arr = append(body.Arr, mongo_bson.VStr(c.Db))
+    }
+    serr := mongo_msg.SendBodySeq(&c.Bc, mongo_msg.NextReqID(), body, "documents", docs)
+    if str.Len(serr.message) > 0 {
+        return int64(0), serr
+    }
+    m, rerr := mongo_msg.Recv(&c.Bc)
+    if str.Len(rerr.message) > 0 {
+        return int64(0), rerr
+    }
+    if !mongo_bson.OkField(m.Body) {
+        return int64(0), errors.New(str.Concat("mongo: ", mongo_bson.ErrMsg(m.Body)))
+    }
+    n, ok := mongo_bson.Get(m.Body, "n")
+    if ok {
+        return n.I64, errors.New("")
+    }
+    return int64(len(docs)), errors.New("")
+}
+
+// Update applies updates to coll. Each entry is {q, u, multi, upsert}.
+pub fn Update(c: *Conn, coll: string, updates: []mongo_bson.Val) -> (int64, errors.Error) {
+    body := mongo_bson.Doc([]string{"update", "updates"},
+        []mongo_bson.Val{mongo_bson.VStr(coll), mongo_bson.Arr(updates)})
+    rep, err := RunCommand(c, c.Db, body)
+    if str.Len(err.message) > 0 {
+        return int64(0), err
+    }
+    n, ok := mongo_bson.Get(rep, "n")
+    if !ok {
+        return int64(0), errors.New("")
+    }
+    return n.I64, errors.New("")
+}
+
+// Delete removes docs matching each {q, limit} entry.
+pub fn Delete(c: *Conn, coll: string, deletes: []mongo_bson.Val) -> (int64, errors.Error) {
+    body := mongo_bson.Doc([]string{"delete", "deletes"},
+        []mongo_bson.Val{mongo_bson.VStr(coll), mongo_bson.Arr(deletes)})
+    rep, err := RunCommand(c, c.Db, body)
+    if str.Len(err.message) > 0 {
+        return int64(0), err
+    }
+    n, ok := mongo_bson.Get(rep, "n")
+    if !ok {
+        return int64(0), errors.New("")
+    }
+    return n.I64, errors.New("")
+}
+
+// Count runs the count command on coll with an optional query.
+pub fn Count(c: *Conn, coll: string, query: mongo_bson.Val) -> (int64, errors.Error) {
+    body := mongo_bson.Doc([]string{"count", "query"},
+        []mongo_bson.Val{mongo_bson.VStr(coll), query})
+    rep, err := RunCommand(c, c.Db, body)
+    if str.Len(err.message) > 0 {
+        return int64(0), err
+    }
+    n, ok := mongo_bson.Get(rep, "n")
+    if !ok {
+        return int64(0), errors.New("")
+    }
+    return n.I64, errors.New("")
+}
+
+// ---- cursors -----------------------------------------------------------------
+
+// Cursor iterates a find/getMore result set across batches.
+pub struct Cursor {
+    Conn:   *Conn
+    Coll:   string
+    ID:     int64
+    Batch:  []mongo_bson.Val
+    Pos:    int
+    Done:   bool
+}
+
+// fillCursor loads reply {cursor:{id, firstBatch|nextBatch}} into cur.
+fn fillCursor(cur: *Cursor, rep: mongo_bson.Val) {
+    cv, ok := mongo_bson.Get(rep, "cursor")
+    if !ok {
+        cur.Done = true
+        return
+    }
+    idv, ok := mongo_bson.Get(cv, "id")
+    if ok {
+        cur.ID = idv.I64
+    }
+    bv, ok := mongo_bson.Get(cv, "firstBatch")
+    if !ok {
+        bv, ok = mongo_bson.Get(cv, "nextBatch")
+    }
+    if ok && bv.Kind == mongo_bson.E_ARRAY {
+        cur.Batch = bv.Arr
+    }
+    cur.Pos = 0
+    cur.Done = cur.ID == int64(0) && len(cur.Batch) == 0
+}
+
+// Next advances the cursor, fetching the next batch when exhausted.
+pub fn Next(cur: *Cursor) -> bool {
+    for {
+        if cur.Pos < len(cur.Batch) {
+            return true
+        }
+        if cur.ID == int64(0) {
+            cur.Done = true
+            return false
+        }
+        gm := mongo_bson.Doc([]string{"getMore", "collection"},
+            []mongo_bson.Val{mongo_bson.VLong(cur.ID), mongo_bson.VStr(cur.Coll)})
+        rep, err := RunCommand(cur.Conn, cur.Conn.Db, gm)
+        if str.Len(err.message) > 0 {
+            cur.Done = true
+            return false
+        }
+        fillCursor(cur, rep)
+        if len(cur.Batch) == 0 && cur.ID == int64(0) {
+            cur.Done = true
+            return false
+        }
+    }
+    return false
+}
+
+// Doc returns the current document (call after Next()).
+pub fn Doc(cur: *Cursor) -> mongo_bson.Val {
+    if cur.Pos < 0 || cur.Pos >= len(cur.Batch) {
+        return mongo_bson.Val{}
+    }
+    d := cur.Batch[cur.Pos]
+    cur.Pos = cur.Pos + 1
+    return d
+}
+
+// Ping runs {ping:1}.
+pub fn Ping(c: *Conn) -> errors.Error {
+    _, err := RunCommand(c, "admin", mongo_bson.Doc(
+        []string{"ping"}, []mongo_bson.Val{mongo_bson.VInt(int64(1))}))
+    return err
+}
+
+// Close releases the socket.
+pub fn Close(c: *Conn) {
+    c.Bc.Close()
+}
