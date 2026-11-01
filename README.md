@@ -28,6 +28,8 @@ scales add markoxley/skink-mongo
 ```skink
 import "mod/markoxley/skink-mongo"
 import "mod/markoxley/skink-mongo/mongo_bson"
+import "mod/markoxley/skink-mongo/mongo_conn"
+import "mod/markoxley/skink-dbx"
 
 fn main() {
     c, err := mongo.Dial("mongodb://user:pass@127.0.0.1:27017/mydb")
