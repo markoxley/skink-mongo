@@ -1,0 +1,138 @@
+// File:    cov_test.skink
+// Purpose: Coverage tests for previously-unexercised mongo API surface:
+//          BSON output-buffer primitives, errmsg extraction, request-id
+//          sequencing, OP_MSG SendBody/SendBodySeq/Recv framing over a
+//          socket pair, and the root Dial wrapper on the fake server.
+module cov_test
+
+import "mongo_bson"
+import "mongo_msg"
+import "mongo_conn"
+import "mongo"
+import "testkit"
+import "mod/markoxley/skink-dbx/dbx_bufconn"
+import "mod/markoxley/skink-dbx/dbx_dsn"
+import "std/str"
+import "std/net"
+import "std/time"
+import "std/errors"
+import "std/waitgroup"
+import "std/testing"
+
+// Raw byte accessor for binary buffers — string indexing is
+// bounds-checked against strlen, which truncates at the first NUL byte.
+extern fn Skink_mem_byte(ptr: string, idx: int64) -> int
+extern fn Skink_mem_write_byte(ptr: string, idx: int64, val: int)
+
+// TestOutBufPrimitives covers Byte/WriteN/I32/CStr/PatchI32/Free.
+pub fn TestOutBufPrimitives() {
+    b := mongo_bson.NewOutBuf(16)
+    mongo_bson.Byte(&b, 0x11)
+    mongo_bson.WriteN(&b, "xy", 2)
+    mongo_bson.I32(&b, 0x33445566)
+    mongo_bson.CStr(&b, "k")
+    testing.AssertTrue(b.Len == 1 + 2 + 4 + 2, "buf len")
+    // patch the i32 we wrote at offset 3
+    mongo_bson.PatchI32(&b, 3, 0x0A0B0C0D)
+    testing.AssertEqualInt(0x0D, Skink_mem_byte(b.Buf, 3), "patched lo")
+    testing.AssertEqualInt(0x0A, Skink_mem_byte(b.Buf, 6), "patched hi")
+    mongo_bson.Free(&b)
+    testing.AssertTrue(b.Len == 0, "freed")
+}
+
+// TestErrMsg covers the {ok:0, errmsg:...} field extractor.
+pub fn TestErrMsg() {
+    bad := mongo_bson.Doc([]string{"ok", "errmsg"},
+        []mongo_bson.Val{mongo_bson.VDouble(0.0), mongo_bson.VStr("nope")})
+    testing.AssertEqualString("nope", mongo_bson.ErrMsg(bad), "errmsg")
+    ok := mongo_bson.Doc([]string{"ok"}, []mongo_bson.Val{mongo_bson.VDouble(1.0)})
+    testing.AssertEqualString("", mongo_bson.ErrMsg(ok), "no errmsg")
+}
+
+// TestNextReqID verifies the request counter increments.
+pub fn TestNextReqID() {
+    a := mongo_msg.NextReqID()
+    b := mongo_msg.NextReqID()
+    testing.AssertTrue(b == a + 1, "req ids increment")
+}
+
+// msgWorker accepts one conn, reads an OP_MSG, echoes it back.
+fn msgWorker(wg: *waitgroup.WaitGroup) {
+    ln, _ := net.Listen("127.0.0.1", 16997)
+    conn, _ := net.Accept(ln)
+    bc := dbx_bufconn.Wrap(conn, "127.0.0.1", 16997)
+    m, _ := mongo_msg.Recv(&bc)
+    doc := mongo_bson.Doc([]string{"ok"}, []mongo_bson.Val{mongo_bson.VDouble(1.0)})
+    mongo_msg.SendBody(&bc, m.ReqID, doc)
+    bc.Close()
+    ln.Close()
+    waitgroup.Done(wg)
+}
+
+// TestSendBodyRecv covers OP_MSG framing round-trip.
+pub fn TestSendBodyRecv() {
+    wg := waitgroup.New()
+    waitgroup.Add(wg, 1)
+    spawn msgWorker(wg)
+    time.SleepMs(30)
+    conn, cerr := net.Connect("127.0.0.1", 16997)
+    testing.AssertEqualString("", cerr.message, "connect")
+    bc := dbx_bufconn.Wrap(conn, "127.0.0.1", 16997)
+    body := mongo_bson.Doc([]string{"ping"}, []mongo_bson.Val{mongo_bson.VInt(int64(1))})
+    serr := mongo_msg.SendBody(&bc, 99, body)
+    testing.AssertEqualString("", serr.message, "sendbody")
+    m, rerr := mongo_msg.Recv(&bc)
+    testing.AssertEqualString("", rerr.message, "recv")
+    testing.AssertEqualInt(99, m.ReqID, "echoed reqid")
+    bc.Close()
+    waitgroup.Wait(wg)
+}
+
+// seqWorker accepts one conn, reads an OP_MSG, closes.
+fn seqWorker(wg: *waitgroup.WaitGroup) {
+    ln, _ := net.Listen("127.0.0.1", 16998)
+    conn, _ := net.Accept(ln)
+    bc := dbx_bufconn.Wrap(conn, "127.0.0.1", 16998)
+    m, _ := mongo_msg.Recv(&bc)
+    _ = m
+    bc.Close()
+    ln.Close()
+    waitgroup.Done(wg)
+}
+
+// TestSendBodySeq covers the kind-1 document-sequence section writer.
+pub fn TestSendBodySeq() {
+    wg := waitgroup.New()
+    waitgroup.Add(wg, 1)
+    spawn seqWorker(wg)
+    time.SleepMs(30)
+    conn, cerr := net.Connect("127.0.0.1", 16998)
+    testing.AssertEqualString("", cerr.message, "connect")
+    bc := dbx_bufconn.Wrap(conn, "127.0.0.1", 16998)
+    body := mongo_bson.Doc([]string{"insert"}, []mongo_bson.Val{mongo_bson.VStr("col")})
+    docs := []mongo_bson.Val{mongo_bson.Doc([]string{"x"}, []mongo_bson.Val{mongo_bson.VInt(int64(1))})}
+    serr := mongo_msg.SendBodySeq(&bc, 1, body, "documents", docs)
+    testing.AssertEqualString("", serr.message, "sendbodyseq")
+    bc.Close()
+    waitgroup.Wait(wg)
+}
+
+// TestDial exercises the root Dial wrapper through the fake server.
+pub fn TestDial() {
+    fs, wg, serr := testkit.StartFakeServer(16999)
+    testing.AssertTrue(str.Len(serr.message) == 0, "fake server")
+    spawn testkit.Serve(&fs, 2, covResponder, wg)
+
+    c, cerr := mongo.Dial("mongodb://127.0.0.1:16999/db")
+    testing.AssertTrue(str.Len(cerr.message) == 0, str.Concat("dial: ", cerr.message))
+    mongo_conn.Close(&c)
+    waitgroup.Wait(wg)
+}
+
+// covResponder replies {ok:1} to every request.
+fn covResponder(doc: mongo_bson.Val) -> testkit.Reply {
+    return testkit.Reply{Doc: mongo_bson.Doc(
+        []string{"ok", "maxWireVersion", "version"},
+        []mongo_bson.Val{mongo_bson.VDouble(1.0), mongo_bson.VInt(int64(17)),
+            mongo_bson.VStr("7.0.0-fake")})}
+}

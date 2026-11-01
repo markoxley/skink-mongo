@@ -24,6 +24,12 @@ import "mod/markoxley/skink-dbx/dbx_bufconn"
 import "mongo_bson"
 import "mongo_msg"
 
+// Raw byte accessors for binary wire/test buffers — string indexing is
+// bounds-checked against strlen, which truncates at the first NUL byte.
+extern fn Skink_mem_byte(ptr: string, idx: int64) -> int
+extern fn Skink_mem_write_byte(ptr: string, idx: int64, val: int)
+
+
 extern fn SHA256(d: string, n: int64, md: string) -> string
 extern fn memcmp(a: string, b: string, n: int64) -> int
 
@@ -69,7 +75,7 @@ fn hmac256(key: string, klen: int, msg: string, mlen: int) -> string {
 fn sha256b(d: string, n: int) -> string {
     out := libc.malloc(33)
     SHA256(d, int64(n), out)
-    out[32] = 0
+    Skink_mem_write_byte(out, int64(32), 0)
     return out
 }
 
@@ -77,10 +83,10 @@ fn sha256b(d: string, n: int) -> string {
 fn hi(pw: string, salt: string, saltLen: int, iters: int) -> string {
     block := libc.malloc(saltLen + 4)
     libc.memcpy(block, salt, saltLen)
-    block[saltLen] = 0
-    block[saltLen + 1] = 0
-    block[saltLen + 2] = 0
-    block[saltLen + 3] = 1
+    Skink_mem_write_byte(block, int64(saltLen), 0)
+    Skink_mem_write_byte(block, int64(saltLen + 1), 0)
+    Skink_mem_write_byte(block, int64(saltLen + 2), 0)
+    Skink_mem_write_byte(block, int64(saltLen + 3), 1)
     u := hmac256(pw, str.Len(pw), block, saltLen + 4)
     libc.free(block)
     t := libc.malloc(33)
@@ -90,11 +96,11 @@ fn hi(pw: string, salt: string, saltLen: int, iters: int) -> string {
         libc.free(u)
         u = n2
         for j := 0; j < 32; j = j + 1 {
-            t[j] = t[j] ^ u[j]
+            Skink_mem_write_byte(t, int64(j), Skink_mem_byte(t, int64(j)) ^ Skink_mem_byte(u, int64(j)))
         }
     }
     libc.free(u)
-    t[32] = 0
+    Skink_mem_write_byte(t, int64(32), 0)
     return t
 }
 
@@ -105,14 +111,14 @@ fn fieldGet(msg: string, key: string) -> string {
     for i := 0; i + kl < n; i = i + 1 {
         hit := true
         for j := 0; j < kl; j = j + 1 {
-            if msg[i + j] != key[j] {
+            if Skink_mem_byte(msg, int64(i + j)) != Skink_mem_byte(key, int64(j)) {
                 hit = false
                 break
             }
         }
-        if hit && (i == 0 || msg[i - 1] == 44) && msg[i + kl] == 61 {
+        if hit && (i == 0 || Skink_mem_byte(msg, int64(i - 1)) == 44) && Skink_mem_byte(msg, int64(i + kl)) == 61 {
             stop := i + kl + 1
-            for stop < n && msg[stop] != 44 {
+            for stop < n && Skink_mem_byte(msg, int64(stop)) != 44 {
                 stop = stop + 1
             }
             return str.Substr(msg, i + kl + 1, stop - (i + kl + 1))
@@ -126,7 +132,7 @@ fn fieldGet(msg: string, key: string) -> string {
 fn stripProof(msg: string) -> string {
     n := str.Len(msg)
     for i := n - 1; i >= 0; i = i - 1 {
-        if msg[i] == 44 && i + 1 < n && msg[i + 1] == 112 && i + 2 < n && msg[i + 2] == 61 {
+        if Skink_mem_byte(msg, int64(i)) == 44 && i + 1 < n && Skink_mem_byte(msg, int64(i + 1)) == 112 && i + 2 < n && Skink_mem_byte(msg, int64(i + 2)) == 61 {
             return str.Substr(msg, 0, i)
         }
     }
@@ -190,7 +196,7 @@ fn scramReply(doc: mongo_bson.Val) -> mongo_bson.Val {
     // Recover ClientKey = proof XOR clientSignature; verify hash.
     ck := libc.malloc(32)
     for i := 0; i < 32; i = i + 1 {
-        ck[i] = proof[i] ^ cSig[i]
+        Skink_mem_write_byte(ck, int64(i), Skink_mem_byte(proof, int64(i)) ^ Skink_mem_byte(cSig, int64(i)))
     }
     h := sha256b(ck, 32)
     okReply := mongo_bson.Doc([]string{"ok", "errmsg"},

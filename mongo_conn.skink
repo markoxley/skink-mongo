@@ -19,6 +19,12 @@ import "mod/markoxley/skink-dbx/dbx_scram"
 import "mongo_bson"
 import "mongo_msg"
 
+// Raw byte accessors for binary wire/test buffers — string indexing is
+// bounds-checked against strlen, which truncates at the first NUL byte.
+extern fn Skink_mem_byte(ptr: string, idx: int64) -> int
+extern fn Skink_mem_write_byte(ptr: string, idx: int64, val: int)
+
+
 // libcrypto: SHA1 digest for SCRAM-SHA-1, MD5 for the legacy password
 // digest, SHA256/HMAC for the testkit-free client side is in dbx_scram.
 extern fn MD5(d: string, n: int64, md: string) -> string
@@ -41,10 +47,10 @@ fn md5Hex(s: string) -> string {
     hex := "0123456789abcdef"
     res := libc.malloc(33)
     for i := 0; i < 16; i = i + 1 {
-        res[i * 2] = hex[out[i] >> 4]
-        res[i * 2 + 1] = hex[out[i] & 15]
+        Skink_mem_write_byte(res, int64(i * 2), hex[Skink_mem_byte(out, int64(i)) >> 4])
+        Skink_mem_write_byte(res, int64(i * 2 + 1), hex[Skink_mem_byte(out, int64(i)) & 15])
     }
-    res[32] = 0
+    Skink_mem_write_byte(res, 32, 0)
     libc.free(out)
     return res
 }
@@ -191,7 +197,7 @@ fn authOne(c: *Conn, authDb: string, user: string, pass: string, sha256: bool) -
 fn copyN(s: string, n: int) -> string {
     out := libc.malloc(n + 1)
     libc.memcpy(out, s, n)
-    out[n] = 0
+    Skink_mem_write_byte(out, int64(n), 0)
     return out
 }
 

@@ -24,6 +24,12 @@ import "mod/markoxley/skink-dbx/dbx_rows"
 import "mongo_conn"
 import "mongo_bson"
 
+// Raw byte accessors for binary wire/test buffers — string indexing is
+// bounds-checked against strlen, which truncates at the first NUL byte.
+extern fn Skink_mem_byte(ptr: string, idx: int64) -> int
+extern fn Skink_mem_write_byte(ptr: string, idx: int64, val: int)
+
+
 // ---- handle registry (Skink cannot cast int64 back to *Conn) ---------
 
 var nextHandle = 0
@@ -146,10 +152,10 @@ fn objectIdHex(s: string) -> string {
     hex := "0123456789abcdef"
     out := libc.malloc(25)
     for i := 0; i < 12; i = i + 1 {
-        out[i * 2] = hex[s[i] >> 4]
-        out[i * 2 + 1] = hex[s[i] & 15]
+        Skink_mem_write_byte(out, int64(i * 2), hex[Skink_mem_byte(s, int64(i)) >> 4])
+        Skink_mem_write_byte(out, int64(i * 2 + 1), hex[Skink_mem_byte(s, int64(i)) & 15])
     }
-    out[24] = 0
+    Skink_mem_write_byte(out, int64(24), 0)
     return out
 }
 

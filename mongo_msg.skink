@@ -19,6 +19,12 @@ import "std/errors"
 import "mod/markoxley/skink-dbx/dbx_bufconn"
 import "mongo_bson"
 
+// Raw byte accessors for binary wire/test buffers — string indexing is
+// bounds-checked against strlen, which truncates at the first NUL byte.
+extern fn Skink_mem_byte(ptr: string, idx: int64) -> int
+extern fn Skink_mem_write_byte(ptr: string, idx: int64, val: int)
+
+
 pub const OP_MSG  = 2013
 pub const OP_REPLY = 1 // legacy reply opcode (never sent, kept for ref)
 
@@ -127,7 +133,7 @@ pub fn Recv(bc: *dbx_bufconn.BufConn) -> (Msg, errors.Error) {
         end = end - 4 // strip trailing CRC-32C
     }
     for br.Pos < end {
-        kind := int(rest[br.Pos])
+        kind := Skink_mem_byte(rest, int64(br.Pos))
         br.Pos = br.Pos + 1
         if kind == 0 {
             doc, derr := mongo_bson.Decode(&br)

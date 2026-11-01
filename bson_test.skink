@@ -9,6 +9,12 @@ import "std/str"
 import "std/libc"
 import "std/testing"
 
+// Raw byte accessors for binary wire/test buffers — string indexing is
+// bounds-checked against strlen, which truncates at the first NUL byte.
+extern fn Skink_mem_byte(ptr: string, idx: int64) -> int
+extern fn Skink_mem_write_byte(ptr: string, idx: int64, val: int)
+
+
 // TestEncodeScalars verifies byte-exact BSON for scalars.
 pub fn TestEncodeScalars() {
     doc := mongo_bson.Doc(
@@ -24,29 +30,29 @@ pub fn TestEncodeScalars() {
     // hand-computed layout
     r := mongo_bson.NewReader(data, n)
     testing.AssertEqualInt(n, mongo_bson.RI32(&r), "doc length")
-    testing.AssertEqualInt(mongo_bson.E_INT32, int(data[r.Pos]), "i32 tag")
+    testing.AssertEqualInt(mongo_bson.E_INT32, Skink_mem_byte(data, int64(r.Pos)), "i32 tag")
     r.Pos = r.Pos + 1
     testing.AssertEqualString("i32", mongo_bson.RCStr(&r), "i32 key")
     testing.AssertEqualInt(42, mongo_bson.RI32(&r), "i32 value")
-    testing.AssertEqualInt(mongo_bson.E_INT64, int(data[r.Pos]), "i64 tag")
+    testing.AssertEqualInt(mongo_bson.E_INT64, Skink_mem_byte(data, int64(r.Pos)), "i64 tag")
     r.Pos = r.Pos + 1
     testing.AssertEqualString("i64", mongo_bson.RCStr(&r), "i64 key")
     testing.AssertTrue(mongo_bson.RI64(&r) == int64(5000000000), "i64 value")
-    testing.AssertEqualInt(mongo_bson.E_STRING, int(data[r.Pos]), "str tag")
+    testing.AssertEqualInt(mongo_bson.E_STRING, Skink_mem_byte(data, int64(r.Pos)), "str tag")
     r.Pos = r.Pos + 1
     mongo_bson.RCStr(&r)
     slen := mongo_bson.RI32(&r)
     testing.AssertEqualInt(3, slen, "str len incl NUL")
     s, _ := mongo_bson.RBytes(&r, 2)
     testing.AssertEqualString("hi", s, "str value")
-    testing.AssertEqualInt(0, int(data[r.Pos]), "str NUL")
+    testing.AssertEqualInt(0, Skink_mem_byte(data, int64(r.Pos)), "str NUL")
     r.Pos = r.Pos + 1
-    testing.AssertEqualInt(mongo_bson.E_BOOL, int(data[r.Pos]), "bool tag")
+    testing.AssertEqualInt(mongo_bson.E_BOOL, Skink_mem_byte(data, int64(r.Pos)), "bool tag")
     r.Pos = r.Pos + 1
     mongo_bson.RCStr(&r)
-    testing.AssertEqualInt(1, int(data[r.Pos]), "bool true")
+    testing.AssertEqualInt(1, Skink_mem_byte(data, int64(r.Pos)), "bool true")
     r.Pos = r.Pos + 1
-    testing.AssertEqualInt(mongo_bson.E_NULL, int(data[r.Pos]), "null tag")
+    testing.AssertEqualInt(mongo_bson.E_NULL, Skink_mem_byte(data, int64(r.Pos)), "null tag")
     libc.free(data)
 }
 
@@ -56,10 +62,10 @@ pub fn TestRoundTrip() {
     arr := mongo_bson.Arr([]mongo_bson.Val{
         mongo_bson.VStr("a"), mongo_bson.VInt(int64(2))})
     bin := libc.malloc(4)
-    bin[0] = 1
-    bin[1] = 0
-    bin[2] = 255
-    bin[3] = 0
+    Skink_mem_write_byte(bin, 0, 1)
+    Skink_mem_write_byte(bin, 1, 0)
+    Skink_mem_write_byte(bin, 2, 255)
+    Skink_mem_write_byte(bin, 3, 0)
     doc := mongo_bson.Doc(
         []string{"d", "arr", "bin", "oid", "dt", "f"},
         []mongo_bson.Val{
@@ -87,8 +93,8 @@ pub fn TestRoundTrip() {
 
     b, _ := mongo_bson.Get(out, "bin")
     testing.AssertEqualInt(4, b.Len, "bin len")
-    testing.AssertEqualInt(0, b.Bytes[1], "bin NUL preserved")
-    testing.AssertEqualInt(255, b.Bytes[2] & 255, "bin byte")
+    testing.AssertEqualInt(0, Skink_mem_byte(b.Bytes, 1), "bin NUL preserved")
+    testing.AssertEqualInt(255, Skink_mem_byte(b.Bytes, 2) & 255, "bin byte")
 
     o, _ := mongo_bson.Get(out, "oid")
     testing.AssertEqualInt(12, o.Len, "oid len")
@@ -120,10 +126,10 @@ pub fn TestPath() {
 // TestMalformed covers truncated/oversized docs failing cleanly.
 pub fn TestMalformed() {
     bad := libc.malloc(4)
-    bad[0] = 99
-    bad[1] = 0
-    bad[2] = 0
-    bad[3] = 0
+    Skink_mem_write_byte(bad, 0, 99)
+    Skink_mem_write_byte(bad, 1, 0)
+    Skink_mem_write_byte(bad, 2, 0)
+    Skink_mem_write_byte(bad, 3, 0)
     r := mongo_bson.NewReader(bad, 4)
     _, err := mongo_bson.Decode(&r)
     testing.AssertTrue(str.Len(err.message) > 0, "short doc rejected")
